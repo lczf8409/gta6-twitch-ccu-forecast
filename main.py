@@ -5,27 +5,45 @@ whose first hour already draws a huge crowd peaks early and decays; a launch
 whose first hour is small keeps building as regions unlock through the day
 (verified on the kit's practice comparables: at hour 24 the median
 viewers/hour-1 ratio is ~1.4 for big hour-1 launches versus ~2.8 for small
-ones). So for each forecast hour h we regress the log ratio
-ln(viewers_h / viewers_1) on ln(viewers_1) across comparable past launches,
-and take the forecast quantiles from a normal spread around that regression:
+ones). The forecast for each hour h is a 50/50 blend of two estimators of
+the log ratio ln(viewers_h / viewers_1), which disagree most exactly where
+it matters -- for very big launches -- so averaging them cuts the variance:
 
-    q_tau(h) = p1 * exp(mu_h + t_tau(df) * sd_h)
+  A. Shrunk per-hour OLS: ln(ratio_h) regressed on ln(viewers_1) across
+     comparable past launches, slope shrunk 20% toward the pooled slope
+     across all hours (partial pooling: each hour's slope is noisy on ~19
+     points, the pooled shape is stable), intercept re-centred through the
+     hour's mean point. Its spread is the residual sd, scaled by
+     (p1 / 1e5) ** -0.25: big launches have stabler shapes, so their
+     intervals narrow (practice coverage was 0.957 with the unscaled
+     spread -- too wide -- while leave-one-out coverage was 0.890).
 
-where mu_h = a_h + b_h * ln(p1) is the regression prediction for the
-target's hour-1 print p1, sd_h is the residual standard deviation, and
-t_tau(df) is the Student-t quantile at each scored level with
-df = n - 2 degrees of freedom (n = training launches). The t
-distribution is the honest small-sample predictive: with only ~19
-launches the residual spread itself is estimated, so the outer
-quantiles widen more than the inner ones, which the normal spread
-understates. The per-hour slope is shrunk 20% toward the pooled slope
-across all hours (partial pooling: each hour's slope is noisy on ~19
-points, the pooled shape is stable), with the intercept re-centred so
-the regression still passes through the hour's mean point.
+  B. Kernel-weighted OLS: the same per-hour regression, but each past
+     launch is weighted by a Gaussian kernel on ln(viewers_1) (bandwidth
+     0.7), so for a mega launch only the biggest past launches count.
+     Leave-one-out showed the global OLS over-predicts a mega launch's
+     mid/late hours by 7-31% in log terms (the log-ratio curve steepens
+     at the top end, which a single linear slope cannot express); the
+     kernel does not extrapolate a global slope, so it corrects that bias.
 
-Leave-one-out over the 19 usable comparables: pinball 0.2642, 90%
-coverage 0.890 (the plain per-hour OLS with a normal spread scored
-0.2665 at the same coverage).
+  The blended median is the average of the two log-medians; the blended
+  spread is the average of the two sds; quantiles are normal quantiles
+  around them:
+
+    q_tau(h) = p1 * exp(mu_h + z_tau * sd_h)
+
+Leave-one-out over the 19 usable comparables (train on all 19 minus the
+held-out launch; the held-out launch's own hours are the truth):
+
+    full set       0.270  (house baseline 0.403)
+    big launches (hour-1 >= 100k, the practice cases' range)  0.180
+    mega launches (hour-1 >= 250k, the final case's range)    0.124
+
+The previous single-estimator version scored 0.264 / 0.191 / 0.156 on the
+same slices, and 0.184 on the public practice board (rank 549/2192 at the
+time). The blend is a flat optimum: varying the kernel bandwidth, the
+sd-scaling exponent and the blend weight over their plausible ranges moves
+the big/mega scores by under 0.005, so no parameter sits on a knife edge.
 
 Training pool: past launches in the case's `comparables` whose unlock tier
 is "comparable" (early-access-contaminated and weak analogues are left
@@ -71,6 +89,13 @@ FORECAST_HOURS = range(2, 25)
 # baseline's random-walk spread, in log units per square-root hour.
 BASELINE_SIGMA = 0.15
 MIN_TRAINING_LAUNCHES = 5
+# Kernel bandwidth (in log viewers_1) for estimator B.
+KERNEL_BW = 0.7
+# Estimator A's spread scales with hour-1 size as (p1 / SD_REF) ** -SD_GAMMA.
+SD_REF = 1e5
+SD_GAMMA = 0.25
+# Weight on estimator A in the blend; the rest goes to estimator B.
+BLEND_W = 0.5
 
 
 def round2(x: float) -> float | int:
@@ -195,23 +220,72 @@ def residual_sd(training: list[dict[int, float]], hour: int, a: float, b: float)
     return max(math.sqrt(variance), 0.1)
 
 
+def ols_mu_sd(
+    p1: float, training: list[dict[int, float]], hour: int, pooled_b: float
+) -> tuple[float, float]:
+    """Estimator A: shrunk per-hour OLS. Returns (mu, sd) in log-ratio
+    units, with the spread already scaled by (p1 / SD_REF) ** -SD_GAMMA
+    and converted from the Student-t spread to a normal-equivalent sd."""
+    a, b = fit_hour(training, hour, pooled_b)
+    sd_res = residual_sd(training, hour, a, b)
+    df = max(len(training) - 2, 1)
+    # The t spread between the 0.95 and 0.05 quantiles, expressed as a
+    # normal-equivalent sd, then scaled by hour-1 size.
+    sd = (t_quantile(1.645, df) / 1.645) * sd_res * (p1 / SD_REF) ** (-SD_GAMMA)
+    return a + b * math.log(p1), sd
+
+
+def kernel_mu_sd(
+    p1: float, training: list[dict[int, float]], hour: int
+) -> tuple[float, float] | None:
+    """Estimator B: Gaussian-kernel-weighted OLS on ln(viewers_1).
+    Returns (mu, sd) in log-ratio units, or None when the weights
+    degenerate (too few effective neighbours)."""
+    lp = math.log(p1)
+    xs: list[float] = []
+    ys: list[float] = []
+    ws: list[float] = []
+    for hours in training:
+        xs.append(math.log(hours[1]))
+        ys.append(math.log(hours[hour] / hours[1]))
+        ws.append(math.exp(-0.5 * ((math.log(hours[1]) - lp) / KERNEL_BW) ** 2))
+    total_w = sum(ws)
+    if total_w <= 0:
+        return None
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+    sxy = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(ws, xs, ys))
+    sxx = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+    if sxx <= 0:
+        return None
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    mean_r = sum(w * r for w, r in zip(ws, residuals)) / total_w
+    variance = sum(w * (r - mean_r) ** 2 for w, r in zip(ws, residuals)) / total_w
+    return intercept + slope * lp, max(math.sqrt(variance), 0.1)
+
+
 def hour_quantiles(
     p1: float, training: list[dict[int, float]], hour: int, pooled_b: float
 ) -> list:
-    """The five forecast quantiles for one hour, non-decreasing by construction."""
+    """The five forecast quantiles for one hour: the 50/50 blend of
+    estimators A and B, non-decreasing by construction."""
     if len(training) < MIN_TRAINING_LAUNCHES:
         return [
             round2(p1 * math.exp(z * BASELINE_SIGMA * math.sqrt(hour - 1)))
             for z in Z
         ]
-    a, b = fit_hour(training, hour, pooled_b)
-    sd = residual_sd(training, hour, a, b)
-    mu = a + b * math.log(p1)
-    df = max(len(training) - 2, 1)
-    quantiles = [
-        round2(p1 * math.exp(mu + t_quantile(z, df) * sd)) for z in Z
-    ]
-    # The t quantiles are ordered by z already; enforce it defensively.
+    mu_a, sd_a = ols_mu_sd(p1, training, hour, pooled_b)
+    kern = kernel_mu_sd(p1, training, hour)
+    if kern is None:
+        mu, sd = mu_a, sd_a
+    else:
+        mu_b, sd_b = kern
+        mu = BLEND_W * mu_a + (1 - BLEND_W) * mu_b
+        sd = BLEND_W * sd_a + (1 - BLEND_W) * sd_b
+    quantiles = [round2(p1 * math.exp(mu + z * sd)) for z in Z]
+    # The quantiles are ordered by z already; enforce it defensively.
     for i in range(1, len(quantiles)):
         if quantiles[i] < quantiles[i - 1]:
             quantiles[i] = quantiles[i - 1]
